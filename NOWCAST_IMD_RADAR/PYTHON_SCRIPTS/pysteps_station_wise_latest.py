@@ -84,9 +84,9 @@ def extract_time_station(file):
     logger.debug(f"Extracted - Station: {station}, Time: {timestamp}")
     return station, timestamp
 
-def find_file_for_time(station, time_check):
-    """Find radar file for a station and timestamp folder; return first match ignoring exact time."""
-    logger.debug(f"Searching for file - Station: {station}, Time: {time_check}")
+def find_actual_file_for_time(station, time_check):
+    """Find ACTUAL radar file for a station and timestamp - NO interpolated files"""
+    logger.debug(f"Searching for ACTUAL file - Station: {station}, Time: {time_check}")
     
     base_folder = os.path.join(
         RADAR_ROOT,
@@ -98,16 +98,18 @@ def find_file_for_time(station, time_check):
         logger.debug(f"Base folder does not exist: {base_folder}")
         return None
 
+    # Look for files that are NOT interpolated (don't contain 'extract_fill_georef')
     pattern = f"caz_{station}_*clip_refl.tif"
     all_files = glob.glob(os.path.join(base_folder, pattern))
-
-    logger.debug(f"Found {len(all_files)} files matching pattern: {pattern}")
+       
+    actual_files = all_files
+    logger.debug(f"Found {len(actual_files)} ACTUAL files matching pattern (excluding interpolated)")
     
-    if all_files:
-        logger.info(f"✅ Found file for {station} at {time_check}: {os.path.basename(all_files[0])}")
-        return all_files[0]
+    if actual_files:
+        logger.info(f"✅ Found ACTUAL file for {station} at {time_check}: {os.path.basename(actual_files[0])}")
+        return actual_files[0]
     else:
-        logger.warning(f"❌ No file found for {station} at {time_check}")
+        logger.warning(f"❌ No ACTUAL file found for {station} at {time_check}")
         return None
 
 def get_interpolation_window(target_idx, available_files, total_timesteps):
@@ -180,21 +182,27 @@ def get_interpolation_window(target_idx, available_files, total_timesteps):
     else:
         # For extrapolation: use standard extrapolation (typically weight=1.0 for one step ahead)
         if target_idx > max(sorted_files):
-            # Extrapolating forward
-            weight = 1.0
+            if ref_idx2 - ref_idx1 == 0:
+                logger.error(f"Cannot extrapolate forward - only one reference frame available: {ref_idx1}")
+                return None, None, None, False
+            weight = (target_idx - ref_idx2) / (ref_idx2 - ref_idx1)
             logger.info(f"FORWARD EXTRAPOLATION: ref1={ref_idx1}, ref2={ref_idx2}, target={target_idx}, weight={weight:.3f}")
         else:
             # Extrapolating backward
             delta = ref_idx2 - ref_idx1
+            if delta == 0:
+                logger.error(f"Cannot extrapolate backward - only one reference frame available: {ref_idx1}")
+                return None, None, None, False
             offset = target_idx - ref_idx1
             weight = offset / delta
             logger.info(f"BACKWARD EXTRAPOLATION: ref1={ref_idx1}, ref2={ref_idx2}, target={target_idx}, weight={weight:.3f}")
     
     return ref_idx1, ref_idx2, weight, is_interpolation
 
-def interpolate_missing_data(files_dict, times_dict, target_idx, target_time, station):
+def create_temporary_interpolated_data(files_dict, times_dict, target_idx, target_time, station):
     """
-    Interpolate missing radar data using temporal window approach
+    Create interpolated radar data temporarily in memory/temp directory ONLY
+    Does NOT save in processing_results directory to prevent false computation loops
     
     Args:
         files_dict: Dictionary of {index: filepath}
@@ -204,11 +212,13 @@ def interpolate_missing_data(files_dict, times_dict, target_idx, target_time, st
         station: Station name
     
     Returns:
-        str: Path to interpolated file
+        str: Path to temporary interpolated file (in temp directory only)
     """
-    logger.info(f"Interpolating missing data for {station} at index {target_idx} ({target_time})")
+    logger.info(f"Creating TEMPORARY interpolated data for {station} at index {target_idx} ({target_time})")
+    logger.warning(f"⚠️  This is interpolated data - will NOT be saved in processing_results to prevent false computation loops")
     
-    available_indices = list(files_dict.keys())
+    available_indices = [idx for idx, path in files_dict.items() if 'temp_interpolated' not in path]
+    logger.debug(f"Available indices for {station}: {available_indices}")
     ref_idx1, ref_idx2, weight, is_interpolation = get_interpolation_window(target_idx, available_indices, len(times_dict))
     
     if ref_idx1 is None:
@@ -252,6 +262,7 @@ def interpolate_missing_data(files_dict, times_dict, target_idx, target_time, st
             # For extrapolation: use standard motion field
             if weight > 0:
                 # Forward extrapolation
+                adjusted_motion = motion_field * weight
                 precip_forecast = extrapolate(train_precip[-1], motion_field, n_leadtimes)
             else:
                 # Backward extrapolation (reverse motion)
@@ -260,32 +271,27 @@ def interpolate_missing_data(files_dict, times_dict, target_idx, target_time, st
         
         forecast_dbz = precip_forecast[0]
         
-        # Save interpolated file
-        folder_path = os.path.join(RADAR_ROOT, f"Realtime_radar_INDIA_{target_time.strftime('%d%b%Y_%H%M')}",
-                                   "Processing_results/clipped_tifs")
-        os.makedirs(folder_path, exist_ok=True)
-        save_name = f"caz_{station}_{target_time.strftime('%d%b%Y_%H%M')}_extract_fill_georef_clip_refl.tif"
-        full_save_path = os.path.join(folder_path, save_name)
+        # CRITICAL CHANGE: Save ONLY in temporary directory - NOT in processing_results
+        # This prevents the interpolated data from being picked up by future runs
+        temp_path = os.path.join(PYSTEPS_TEMP_DIR, f"temp_interpolated_{station}_{target_time.strftime('%d%b%Y_%H%M')}_refl.tif")
         
-        with rasterio.open(full_save_path, "w", **profile) as dst:
-            dst.write(forecast_dbz.astype(np.float32), 1)
-        
-        # Also save in temp directory
-        temp_path = os.path.join(PYSTEPS_TEMP_DIR, f"interpolated_{station}_{target_time.strftime('%d%b%Y_%H%M')}_refl.tif")
         with rasterio.open(temp_path, "w", **profile) as dst:
             dst.write(forecast_dbz.astype(np.float32), 1)
         
         interpolation_type = "INTERPOLATED" if is_interpolation else "EXTRAPOLATED"
-        logger.info(f"✅ Successfully {interpolation_type} missing data for {station} at {target_time}")
-        return full_save_path
+        logger.info(f"✅ Successfully created TEMPORARY {interpolation_type} data for {station} at {target_time}")
+        logger.info(f"📁 Temporary file saved at: {temp_path}")
+        
+        return temp_path
         
     except Exception as e:
-        logger.error(f"❌ Error interpolating missing data for {station}: {e}", exc_info=True)
+        logger.error(f"❌ Error creating temporary interpolated data for {station}: {e}", exc_info=True)
         return None
 
 def collect_station_data(station, forecast_time, required_timesteps=8):
     """
-    Collect radar data for a station, interpolating missing timesteps
+    Collect radar data for a station, creating temporary interpolated data for missing timesteps
+    Uses ONLY actual radar data as reference - prevents false computation loops
     
     Args:
         station: Station name
@@ -296,46 +302,54 @@ def collect_station_data(station, forecast_time, required_timesteps=8):
         tuple: (files_list, times_list, success_flag)
     """
     logger.info(f"Collecting data for station {station} with {required_timesteps} timesteps")
+    logger.info(f"🔍 Searching for ACTUAL radar data only (no previous interpolations)")
     
     # Initialize data structures
     files_dict = {}
     times_dict = {}
     
-    # First pass: collect all available files
+    # First pass: collect all available ACTUAL files only
     for i in range(required_timesteps):
         t = forecast_time - timedelta(minutes=10 * (required_timesteps - 1 - i))
         times_dict[i] = t
         
-        f = find_file_for_time(station, t)
+        # Use the new function that only finds actual files
+        f = find_actual_file_for_time(station, t)
         if f:
             files_dict[i] = f
-            logger.info(f"✅ Found file for timestep {i}: {t.strftime('%H%M')}")
+            logger.info(f"✅ Found ACTUAL file for timestep {i}: {t.strftime('%H%M')}")
         else:
-            logger.warning(f"❌ Missing file for timestep {i}: {t.strftime('%H%M')}")
+            logger.warning(f"❌ Missing ACTUAL file for timestep {i}: {t.strftime('%H%M')}")
     
     # Check if we have enough files for interpolation
     available_count = len(files_dict)
     missing_indices = [i for i in range(required_timesteps) if i not in files_dict]
     
-    logger.info(f"Data collection summary: {available_count}/{required_timesteps} files available")
+    logger.info(f"Data collection summary: {available_count}/{required_timesteps} ACTUAL files available")
     logger.info(f"Missing indices: {missing_indices}")
     
     if available_count < 2:
-        logger.error(f"Insufficient data for {station}: only {available_count} files available")
+        logger.error(f"Insufficient ACTUAL data for {station}: only {available_count} files available")
+        logger.error(f"⚠️  Cannot perform reliable interpolation - need at least 2 actual radar files")
         return [], [], False
     
-    # Second pass: interpolate missing files
+    # Check data quality - if too many missing files, issue warning
+    if len(missing_indices) > required_timesteps // 2:
+        logger.warning(f"⚠️  HIGH INTERPOLATION RATIO: {len(missing_indices)}/{required_timesteps} files need interpolation")
+        logger.warning(f"⚠️  This may indicate radar data availability issues")
+    
+    # Second pass: create temporary interpolated files for missing data
     for missing_idx in missing_indices:
         target_time = times_dict[missing_idx]
-        logger.info(f"Attempting to interpolate missing timestep {missing_idx}: {target_time.strftime('%H%M')}")
+        logger.info(f"Creating temporary interpolated data for timestep {missing_idx}: {target_time.strftime('%H%M')}")
         
-        interpolated_file = interpolate_missing_data(files_dict, times_dict, missing_idx, target_time, station)
+        temp_interpolated_file = create_temporary_interpolated_data(files_dict, times_dict, missing_idx, target_time, station)
         
-        if interpolated_file:
-            files_dict[missing_idx] = interpolated_file
-            logger.info(f"✅ Successfully interpolated timestep {missing_idx}")
+        if temp_interpolated_file:
+            files_dict[missing_idx] = temp_interpolated_file
+            logger.info(f"✅ Successfully created temporary interpolated data for timestep {missing_idx}")
         else:
-            logger.error(f"❌ Failed to interpolate timestep {missing_idx}")
+            logger.error(f"❌ Failed to create interpolated data for timestep {missing_idx}")
     
     # Final check
     final_count = len(files_dict)
@@ -345,6 +359,12 @@ def collect_station_data(station, forecast_time, required_timesteps=8):
         times_list = [times_dict[i] for i in sorted(times_dict.keys())]
         
         logger.info(f"✅ Successfully collected all {required_timesteps} timesteps for {station}")
+        
+        # Log the data source summary
+        actual_files = sum(1 for f in files_list if 'temp_interpolated' not in f)
+        interpolated_files = sum(1 for f in files_list if 'temp_interpolated' in f)
+        logger.info(f"📊 Data source summary: {actual_files} actual files, {interpolated_files} temporary interpolated files")
+        
         return files_list, times_list, True
     else:
         logger.error(f"❌ Still missing data for {station}: {final_count}/{required_timesteps} files")
@@ -356,7 +376,9 @@ def stack_to_nc(files, times, output_nc):
     
     data = []
     for i, f in enumerate(files):
-        logger.debug(f"Reading file {i+1}/{len(files)}: {os.path.basename(f)}")
+        file_type = "INTERPOLATED" if 'temp_interpolated' in f else "ACTUAL"
+        logger.debug(f"Reading file {i+1}/{len(files)} [{file_type}]: {os.path.basename(f)}")
+        
         with rasterio.open(f) as src:
             arr = src.read(1)
             data.append(arr)
@@ -434,12 +456,21 @@ def run_station_forecast(station, files, times, outdir, station_obs_dir):
 
         logger.info(f"✅ All forecasts saved successfully for {station}")
         
-        # Clean up temporary netCDF file
+        # Clean up temporary files
         try:
             os.remove(nc_path)
             logger.debug(f"Temporary netCDF file removed: {nc_path}")
         except:
             logger.warning(f"Could not remove temporary file: {nc_path}")
+            
+        # Clean up temporary interpolated files
+        for f in files:
+            if 'temp_interpolated' in f:
+                try:
+                    os.remove(f)
+                    logger.debug(f"Temporary interpolated file removed: {os.path.basename(f)}")
+                except:
+                    logger.warning(f"Could not remove temporary interpolated file: {f}")
         
     except Exception as e:
         logger.error(f"❌ Error in run_station_forecast for {station}: {e}", exc_info=True)
@@ -449,6 +480,7 @@ def run_station_forecast(station, files, times, outdir, station_obs_dir):
 if __name__ == "__main__":
     logger.info("="*80)
     logger.info("STARTING ENHANCED PYSTEPS RADAR NOWCASTING SYSTEM")
+    logger.info("🚫 FALSE COMPUTATION LOOP PREVENTION ENABLED")
     logger.info("="*80)
     
     forecast_time = datetime.strptime(timestamp_str, "%d%b%Y_%H%M")
@@ -459,6 +491,8 @@ if __name__ == "__main__":
     logger.info(f"Forecast time: {forecast_time}")
     logger.info(f"Temporal window size: {TEMPORAL_WINDOW_SIZE} timesteps")
     logger.info(f"Processing {len(stations)} stations: {stations}")
+    logger.info(f"⚠️  IMPORTANT: Interpolated data will NOT be saved in processing_results directory")
+    logger.info(f"⚠️  This prevents false computation loops from cascading interpolations")
     
     successful_stations = []
     failed_stations = []
@@ -468,15 +502,16 @@ if __name__ == "__main__":
         logger.info(f"Processing station {station_idx+1}/{len(stations)}: {station}")
         logger.info("="*60)
         
-        # Use enhanced data collection with interpolation
+        # Use enhanced data collection with temporary interpolation
         files, times, success = collect_station_data(station, forecast_time, required_timesteps = TEMPORAL_WINDOW_SIZE)
         
         if success:
             logger.info(f"✅ Successfully collected all data for {station}. Starting forecast generation.")
             
-            # Log file details
+            # Log file details with source type
             for i, (f, t) in enumerate(zip(files, times)):
-                logger.debug(f"  File {i+1}: {t.strftime('%H%M')} -> {os.path.basename(f)}")
+                file_type = "INTERPOLATED (temp)" if 'temp_interpolated' in f else "ACTUAL"
+                logger.debug(f"  File {i+1} [{file_type}]: {t.strftime('%H%M')} -> {os.path.basename(f)}")
             
             station_for_dir = os.path.join(FORECAST_OUT, station)
             os.makedirs(station_for_dir, exist_ok=True)
@@ -494,8 +529,8 @@ if __name__ == "__main__":
                 logger.error(f"❌ Station {station} failed during forecast generation: {e}")
                 failed_stations.append((station, str(e)))
         else:
-            logger.warning(f"⏭️ Skipping station {station} due to insufficient data")
-            failed_stations.append((station, "Insufficient data after interpolation"))
+            logger.warning(f"⏭️ Skipping station {station} due to insufficient actual radar data")
+            failed_stations.append((station, "Insufficient actual radar data"))
 
     # Final summary
     logger.info("="*80)
@@ -514,12 +549,14 @@ if __name__ == "__main__":
             logger.info(f"  - {station}: {reason}")
     
     logger.info("="*80)
+    logger.info("🚫 FALSE COMPUTATION LOOP PREVENTION - SUMMARY")
+    logger.info("✅ Interpolated data was NOT saved in processing_results directories")
+    logger.info("✅ Future runs will only use actual radar data as reference")
+    logger.info("✅ This prevents cascading interpolations from stale data")
+    logger.info("="*80)
     logger.info("ENHANCED PYSTEPS RADAR NOWCASTING SYSTEM FINISHED")
     logger.info("="*80)
     
     et = time.time()
     logger.info(f"Total time taken: {(et - st) :.2f} secs")
     print(f"Total time taken: {(et - st) :.2f} secs")
-
-
-
